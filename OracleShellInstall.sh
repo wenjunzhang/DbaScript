@@ -306,7 +306,9 @@ function mv_file() {
     # 检查文件是否存在
     if check_file "$file_path"; then
       # 不存在则备份为原始文件
-      /bin/mv -f "$file_path"{,.original} >/dev/null 2>&1
+      if ! /bin/mv -f "$file_path"{,.original}; then
+        color_printf yellow "警告：备份文件 $file_path 失败"
+      fi
     fi
   fi
 }
@@ -314,8 +316,9 @@ function rm_file() {
   local file=$1
   # 检查文件是否存在
   if check_file "$file"; then
-    # 不存在则备份为原始文件
-    /bin/rm -rf "$file" >/dev/null 2>&1
+    if ! /bin/rm -rf "$file"; then
+      color_printf yellow "警告：删除文件 $file 失败"
+    fi
   fi
 }
 function backup_restore_file() {
@@ -345,23 +348,42 @@ EOF
 }
 function run_as_oracle() {
   local command="$1"
+  local rc
   su - "$oracle_user" -c "$command"
+  rc=$?
+  if ((rc != 0)); then
+    color_printf yellow "警告：以 $oracle_user 用户执行命令返回非零状态码: $rc"
+  fi
+  return $rc
 }
 function run_as_grid() {
   local command="$1"
+  local rc
   su - "$grid_user" -c "$command"
+  rc=$?
+  if ((rc != 0)); then
+    color_printf yellow "警告：以 $grid_user 用户执行命令返回非零状态码: $rc"
+  fi
+  return $rc
 }
 function execute_sqlplus() {
   local dbname="$1" format="$2" sql="$3"
+  local rc
   su - "$oracle_user" <<-SOF
 source /home/$oracle_user/.$dbname
 sqlplus -S / as sysdba<<-\EOF
+whenever sqlerror exit sql.sqlcode
 set lin 2222 pages 1000 tab off feedback off
 $format
 $sql
 exit;
 EOF
 SOF
+  rc=$?
+  if ((rc != 0)); then
+    color_printf yellow "警告：sqlplus 执行 SQL 返回非零状态码: $rc (数据库: $dbname)"
+  fi
+  return $rc
 }
 function check_ip() {
   # 检查 IP 地址格式是否正确
@@ -409,7 +431,9 @@ function clean_disk_and_get_wwid() {
       if hexdump -C -n 102400 "$disk" | grep -q "$identifier"; then
         color_printf purple "检查 ASM 磁盘 [ $disk ] 中已存在磁盘组名称 [ $identifier ] 信息，请确认是否格式化磁盘 (Y/N): [Y] "
         echo
-        dd if=/dev/zero of="$disk" bs=4096 count=1 >/dev/null 2>&1
+        if ! dd if=/dev/zero of="$disk" bs=4096 count=1 >>"$oracleinstalllog" 2>&1; then
+          color_printf red "格式化磁盘 $disk 失败，请检查磁盘状态和权限！"
+        fi
       fi
       # 获取磁盘 WWID
       wwid=$(get_wwid "$disk")
@@ -729,11 +753,18 @@ function check_iso() {
 # 创建备份目录并移动文件
 function backup_repos() {
   local bak_type="$1" source_repo="$2" backup_repo="$3"
-  /bin/mkdir -p "$backup_repo" >/dev/null 2>&1
+  if ! /bin/mkdir -p "$backup_repo" 2>>"$oracleinstalllog"; then
+    color_printf yellow "警告：创建备份目录 $backup_repo 失败"
+    return 1
+  fi
   if [[ "$bak_type" == "d" ]]; then
-    find "$source_repo" -mindepth 1 -maxdepth 1 -type f -exec /bin/mv -f {} "$backup_repo" \; >/dev/null 2>&1
+    if ! find "$source_repo" -mindepth 1 -maxdepth 1 -type f -exec /bin/mv -f {} "$backup_repo" \; 2>>"$oracleinstalllog"; then
+      color_printf yellow "警告：备份目录 $source_repo 中的文件失败"
+    fi
   elif [[ "$bak_type" == "f" ]]; then
-    /bin/mv -f "$source_repo" "$backup_repo" >/dev/null 2>&1
+    if ! /bin/mv -f "$source_repo" "$backup_repo" 2>>"$oracleinstalllog"; then
+      color_printf yellow "警告：备份文件 $source_repo 失败"
+    fi
   fi
 }
 #==============================================================#
@@ -788,9 +819,13 @@ function kill_process() {
 function cascade_del_file() {
   local file_path=$1
   if [[ -d "$file_path" ]]; then
-    find "$file_path" -mindepth 1 -delete >/dev/null 2>&1
+    if ! find "$file_path" -mindepth 1 -delete; then
+      color_printf yellow "警告：级联删除目录 $file_path 内容失败"
+    fi
   elif [[ -f "$file_path" ]]; then
-    /bin/rm -f "$file_path" >/dev/null 2>&1
+    if ! /bin/rm -f "$file_path"; then
+      color_printf yellow "警告：删除文件 $file_path 失败"
+    fi
   fi
 }
 #==============================================================#
@@ -869,13 +904,19 @@ function conf_swap() {
     log_print "配置 SWAP 交换空间"
     rm_file /swapfile
     # 创建指定大小的空文件 /swapfile，并将其格式化为交换分区
-    dd if=/dev/zero of=/swapfile bs=1K count=$swap_count >/dev/null 2>&1
+    if ! dd if=/dev/zero of=/swapfile bs=1K count=$swap_count >>"$oracleinstalllog" 2>&1; then
+      color_printf red "创建 Swap 文件失败，请检查磁盘空间！"
+    fi
     # 设置文件权限为 0600
     chmod 600 /swapfile
     # 格式化文件为 Swap 分区
-    mkswap /swapfile >/dev/null 2>&1
+    if ! mkswap /swapfile >>"$oracleinstalllog" 2>&1; then
+      color_printf red "格式化 Swap 分区失败！"
+    fi
     # 启用 Swap 分区
-    swapon /swapfile >/dev/null 2>&1
+    if ! swapon /swapfile >>"$oracleinstalllog" 2>&1; then
+      color_printf red "启用 Swap 分区失败！"
+    fi
     # 将 Swap 分区信息添加到 /etc/fstab 文件中，以便系统重启后自动加载
     write_file "N" "/etc/fstab" "/swapfile swap swap defaults 0 0"
     free -m
@@ -958,12 +999,14 @@ function install_package() {
     # 直接尝试安装软件包
     install_cmd="$yum_cmd install -y \"$package\""
     # 执行安装命令并检查是否成功
-    if ! eval "$install_cmd" >/dev/null 2>&1; then
+    if ! eval "$install_cmd" >>"$oracleinstalllog" 2>&1; then
       if is_in_list "$package" "${must_packages[@]}"; then
         if [[ "$package" =~ ^libnsl[0-9]*$ ]]; then
           if [[ "$oracle_install_mode" =~ ^(rac|standalone)$ ]]; then
             color_printf red "Oracle Gird 安装需要依赖包 $package ，当前未成功安装，请检查。"
           fi
+        else
+          color_printf yellow "警告：必需依赖包 $package 安装失败，可能会影响后续安装"
         fi
       fi
     fi
@@ -1133,7 +1176,9 @@ function create_users_groups() {
     local gid=${group##*:}
     # 如果不存在，则创建新组
     if ! grep -E -q "^$groupname:" /etc/group; then
-      groupadd -g "$gid" "$groupname" >/dev/null 2>&1
+      if ! groupadd -g "$gid" "$groupname" 2>>"$oracleinstalllog"; then
+        color_printf yellow "警告：创建组 $groupname (GID: $gid) 失败"
+      fi
     fi
   done
   for user in "${user_groups[@]}"; do
@@ -1142,12 +1187,18 @@ function create_users_groups() {
     local primary_group=oinstall
     local other_groups=dba,oper,backupdba,dgdba,kmdba,racdba${flag:+",asmdba"}${flag:+",asmoper"}${flag:+",asmadmin"}
     if ! id -u "$user" >/dev/null 2>&1; then
-      useradd -u "$uid" -g $primary_group -G "$other_groups" -m "$user" >/dev/null 2>&1
+      if ! useradd -u "$uid" -g $primary_group -G "$other_groups" -m "$user" 2>>"$oracleinstalllog"; then
+        color_printf red "创建用户 $user 失败，请检查日志 $oracleinstalllog"
+      fi
     else
-      usermod -g $primary_group -G "$other_groups" "$user" >/dev/null 2>&1
+      if ! usermod -g $primary_group -G "$other_groups" "$user" 2>>"$oracleinstalllog"; then
+        color_printf yellow "警告：修改用户 $user 的组信息失败"
+      fi
     fi
     # 为用户设置密码
-    echo "$user:${passwd_groups[$user]}" | chpasswd >/dev/null 2>&1
+    if ! echo "$user:${passwd_groups[$user]}" | chpasswd 2>>"$oracleinstalllog"; then
+      color_printf yellow "警告：设置用户 $user 密码失败"
+    fi
     # 记录日志，输出创建的 grid 和 oracle 用户信息
     color_printf blue "$user 用户："
     id "$user"
@@ -1159,19 +1210,33 @@ function create_users_groups() {
 #==============================================================#
 function create_dir() {
   # 创建 Oracle 环境所需目录
-  /bin/mkdir -p "$env_oracle_home" "$env_oracle_inven" "$backup_dir" "$oradata_dir"
+  if ! /bin/mkdir -p "$env_oracle_home" "$env_oracle_inven" "$backup_dir" "$oradata_dir"; then
+    color_printf red "创建 Oracle 环境目录失败，请检查磁盘空间和权限！"
+  fi
   # 如果安装模式是 standalone
   if [[ "$oracle_install_mode" == "standalone" ]]; then
     cascade_del_file "$env_grid_home"
     # 创建额外的目录，并设置属性
-    /bin/mkdir -p "$env_grid_base" "$env_grid_home"
-    chown -R "$grid_user":oinstall {"$env_base_dir","$env_grid_home","$env_oracle_inven"}
-    chown -R "$oracle_user":oinstall {"$backup_dir","$env_oracle_base"}
+    if ! /bin/mkdir -p "$env_grid_base" "$env_grid_home"; then
+      color_printf red "创建 Grid 目录失败，请检查磁盘空间和权限！"
+    fi
+    if ! chown -R "$grid_user":oinstall {"$env_base_dir","$env_grid_home","$env_oracle_inven"}; then
+      color_printf red "修改 Grid 目录属主失败！"
+    fi
+    if ! chown -R "$oracle_user":oinstall {"$backup_dir","$env_oracle_base"}; then
+      color_printf red "修改 Oracle 目录属主失败！"
+    fi
   else
-    /bin/mkdir -p "$archive_dir"
-    chown -R "$oracle_user":oinstall {"$oradata_dir","$backup_dir","$env_base_dir","$archive_dir"}
+    if ! /bin/mkdir -p "$archive_dir"; then
+      color_printf red "创建归档目录 $archive_dir 失败！"
+    fi
+    if ! chown -R "$oracle_user":oinstall {"$oradata_dir","$backup_dir","$env_base_dir","$archive_dir"}; then
+      color_printf red "修改 Oracle 目录属主失败！"
+    fi
   fi
-  chmod -R 775 "$env_base_dir"
+  if ! chmod -R 775 "$env_base_dir"; then
+    color_printf yellow "警告：修改 $env_base_dir 权限失败"
+  fi
 }
 #==============================================================#
 #                        配置 avahi deamon                      #
@@ -1265,7 +1330,9 @@ vm.hugetlb_shm_group=54321"
   fi
   # 重新加载 sysctl 配置，并将结果输出到日志中
   color_printf blue "查看 sysctl.conf 配置情况 ：sysctl -p"
-  sysctl -p
+  if ! sysctl -p; then
+    color_printf yellow "警告：sysctl -p 重新加载配置失败，请检查 sysctl.conf 参数"
+  fi
 }
 #==============================================================#
 #                         配置 RemoveIPC                        #
@@ -1284,8 +1351,12 @@ function conf_ipc() {
     sed -i 's/#RemoveIPC=no/RemoveIPC=no/' "$logind_file"
   fi
   # 重新加载 systemd 守护进程并重启 systemd-logind 服务
-  systemctl daemon-reload >/dev/null 2>&1
-  systemctl restart systemd-logind >/dev/null 2>&1
+  if ! systemctl daemon-reload >>"$oracleinstalllog" 2>&1; then
+    color_printf yellow "警告：systemctl daemon-reload 执行失败"
+  fi
+  if ! systemctl restart systemd-logind >>"$oracleinstalllog" 2>&1; then
+    color_printf yellow "警告：systemctl restart systemd-logind 执行失败"
+  fi
   # 检查是否已修改成功
   color_printf blue "查看 RemoveIPC ：$logind_file"
   grep "RemoveIPC" "$logind_file"
@@ -1366,8 +1437,10 @@ function install_rlwrap() {
   /bin/mkdir -p "$software_dir"/rlwrap && cd "$software_dir"/rlwrap || return 1
   # 解压缩文件
   tar -xf "$software_dir"/rlwrap-*.gz --strip-components 1 -C "$software_dir"/rlwrap
-  # 配置、编译和安装软件，并将日志重定向到/dev/null以避免输出干扰
-  (./configure -q && make -s && make install -s prefix=/usr/local libdir=/usr/local/libexec) >/dev/null 2>&1
+  # 配置、编译和安装软件
+  if ! (./configure -q && make -s && make install -s prefix=/usr/local libdir=/usr/local/libexec) >>"$oracleinstalllog" 2>&1; then
+    color_printf yellow "警告：rlwrap 编译安装过程中出现错误，请检查日志 $oracleinstalllog"
+  fi
   # 返回 /soft 目录
   cd ..
   # 删除不必要的文件夹和文件
@@ -1611,10 +1684,14 @@ alias $ALIAS
     # 启用及查看多路径服务状态
     case "$os_version" in
     "6")
-      service multipathd restart >/dev/null 2>&1
+      if ! service multipathd restart >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：multipathd 服务重启失败"
+      fi
       ;;
     *)
-      systemctl restart multipathd >/dev/null 2>&1
+      if ! systemctl restart multipathd >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：multipathd 服务重启失败"
+      fi
       ;;
     esac
     color_printf blue "检查 Mulltipath 多路径情况：" >>"$oracleinstalllog"
@@ -1687,7 +1764,9 @@ function unzip_gridsoft() {
       echo
       color_printf green "静默安装 cvu 软件：$cvu_name"
       echo
-      rpm -Uvh --quiet "$cvuqdisk" >/dev/null 2>&1
+      if ! rpm -Uvh --quiet "$cvuqdisk" >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：cvuqdisk 安装失败，请检查日志 $oracleinstalllog"
+      fi
     fi
   fi
 }
@@ -1814,7 +1893,9 @@ function install_gridsoft() {
   log_print "静默安装 Grid 软件"
   color_printf blue "正在安装 Grid 软件："
   # 安装 Grid 软件
-  run_as_grid "$gridinstall_cmd"
+  if ! run_as_grid "$gridinstall_cmd"; then
+    color_printf red "Grid 软件安装失败，请检查日志 $oracleinstalllog"
+  fi
   # Grid 软件安装后步骤
   after_grid_install "$@"
   # 打印日志
@@ -1859,12 +1940,16 @@ function after_grid_install() {
     exec_root "$env_grid_home"
     # 执行 configToolAllCommands 完成 Grid 基础配置
     if ! check_file "$env_grid_home"/cfgtoollogs/configToolAllCommands; then
-      run_as_grid "$env_grid_home/oui/bin/runConfig.sh ORACLE_HOME=$env_grid_home MODE=perform ACTION=configure RERUN=true $*" >/dev/null 2>&1
+      if ! run_as_grid "$env_grid_home/oui/bin/runConfig.sh ORACLE_HOME=$env_grid_home MODE=perform ACTION=configure RERUN=true $*" >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：Grid runConfig.sh 执行返回非零状态码，请检查日志 $oracleinstalllog"
+      fi
     fi
     # 添加 asm 账户密码信息到 cfgrsp.properties 文件中
     write_file "N" "/home/$grid_user/cfgrsp.properties" "oracle.assistants.asm|S_ASMPASSWORD=$database_passwd
 oracle.assistants.asm|S_ASMMONITORPASSWORD=$database_passwd"
-    run_as_grid "$env_grid_home/cfgtoollogs/configToolAllCommands RESPONSE_FILE=/home/$grid_user/cfgrsp.properties" >/dev/null 2>&1
+    if ! run_as_grid "$env_grid_home/cfgtoollogs/configToolAllCommands RESPONSE_FILE=/home/$grid_user/cfgrsp.properties" >>"$oracleinstalllog" 2>&1; then
+      color_printf yellow "警告：Grid configToolAllCommands 执行返回非零状态码，请检查日志 $oracleinstalllog"
+    fi
     rm_file /home/"$grid_user"/cfgrsp.properties
     ;;
   "12" | "19" | "21" | "23")
@@ -1873,11 +1958,15 @@ oracle.assistants.asm|S_ASMMONITORPASSWORD=$database_passwd"
       if check_file "$env_grid_home"/install/files.lst.original; then
         /bin/mv -f "$env_grid_home"/install/files.lst.original "$env_grid_home"/install/files.lst
       fi
-      make -s -f "$env_grid_home"/rdbms/lib/ins_rdbms.mk client_sharedlib libasmclntsh12.ohso libasmperl12.ohso ORACLE_HOME="$env_grid_home" >/dev/null 2>&1
+      if ! make -s -f "$env_grid_home"/rdbms/lib/ins_rdbms.mk client_sharedlib libasmclntsh12.ohso libasmperl12.ohso ORACLE_HOME="$env_grid_home" >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：Grid 12c make client_sharedlib 执行失败，请检查日志 $oracleinstalllog"
+      fi
     fi
     # 执行 root 脚本
     exec_root "$env_grid_home"
-    run_as_grid "$env_grid_home/gridSetup.sh -executeConfigTools -responseFile $software_dir/grid.rsp -silent" >/dev/null 2>&1
+    if ! run_as_grid "$env_grid_home/gridSetup.sh -executeConfigTools -responseFile $software_dir/grid.rsp -silent" >>"$oracleinstalllog" 2>&1; then
+      color_printf yellow "警告：Grid executeConfigTools 执行返回非零状态码，请检查日志 $oracleinstalllog"
+    fi
     ;;
   esac
 }
@@ -1922,10 +2011,14 @@ function create_asmgroup() {
   log_print "ASM 磁盘组创建"
   color_printf blue "正在创建 ASM 磁盘组："
   # 操作Grid用户创建数据磁盘组
-  run_as_grid "$data_asmca_cmd"
+  if ! run_as_grid "$data_asmca_cmd"; then
+    color_printf red "创建 ASM DATA 磁盘组失败，请检查日志 $oracleinstalllog"
+  fi
   # 判断归档磁盘是否存在，并操作Grid用户创建归档磁盘组
   if [[ -n "$arch_asmca_cmd" ]]; then
-    run_as_grid "$arch_asmca_cmd"
+    if ! run_as_grid "$arch_asmca_cmd"; then
+      color_printf red "创建 ASM ARCH 磁盘组失败，请检查日志 $oracleinstalllog"
+    fi
   fi
   color_printf blue "查看 ASM 磁盘组：asmcmd lsdg"
   run_as_grid "asmcmd lsdg"
@@ -2070,7 +2163,9 @@ function install_dbsoft() {
   log_print "静默安装数据库软件"
   color_printf blue "正在安装 Oracle 软件："
   # 安装数据库软件
-  run_as_oracle "$oracleinstall_cmd"
+  if ! run_as_oracle "$oracleinstall_cmd"; then
+    color_printf red "Oracle 软件安装失败，请检查日志 $oracleinstalllog"
+  fi
   # 安装 Oracle 软件后操作
   after_oracle_install
   # 打印日志
@@ -2085,14 +2180,20 @@ function after_oracle_install() {
   "11" | "12")
     if ((db_version == 11 && gi_version > 11)); then
       # 如果 GI 和 DB 版本不一致，[INS-35354] The system on which you are attempting to install Oracle RAC is not part of a valid cluster
-      run_as_grid "$env_grid_home/oui/bin/runInstaller -updateNodeList ORACLE_HOME=$env_grid_home CRS=true" >/dev/null 2>&1
+      if ! run_as_grid "$env_grid_home/oui/bin/runInstaller -updateNodeList ORACLE_HOME=$env_grid_home CRS=true" >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：Grid updateNodeList 执行返回非零状态码，请检查日志 $oracleinstalllog"
+      fi
     fi
     # 执行 root 脚本
     exec_root "$env_oracle_home"
     # 在 Linux6 上安装 12c 需要设置 irman、ioracle
     if ((db_version == 12 && os_version == 6)); then
-      run_as_oracle "make -s -f $env_oracle_home/rdbms/lib/ins_rdbms.mk irman" >/dev/null 2>&1
-      run_as_oracle "make -s -f $env_oracle_home/rdbms/lib/ins_rdbms.mk ioracle" >/dev/null 2>&1
+      if ! run_as_oracle "make -s -f $env_oracle_home/rdbms/lib/ins_rdbms.mk irman" >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：make irman 执行失败，请检查日志 $oracleinstalllog"
+      fi
+      if ! run_as_oracle "make -s -f $env_oracle_home/rdbms/lib/ins_rdbms.mk ioracle" >>"$oracleinstalllog" 2>&1; then
+        color_printf yellow "警告：make ioracle 执行失败，请检查日志 $oracleinstalllog"
+      fi
     fi
     # 安装 11GR2 需要修改 -lnnz11
     if ((db_version == 11)); then
@@ -2286,7 +2387,9 @@ function create_db() {
     # 打印日志到终端和文件
     log_print "创建数据库实例：$name"
     color_printf blue "正在创建数据库：$name"
-    run_as_oracle "$dbca_cmd"
+    if ! run_as_oracle "$dbca_cmd"; then
+      color_printf red "创建数据库 $name 失败，请检查日志 $oracleinstalllog"
+    fi
     # 配置 Oracle Managed Files（OMF）
     conf_omf "$name"
     # 创建 PDB
