@@ -347,24 +347,10 @@ EOF
   fi
 }
 function run_as_oracle() {
-  local command="$1"
-  local rc
-  su - "$oracle_user" -c "$command"
-  rc=$?
-  if ((rc != 0)); then
-    color_printf yellow "警告：以 $oracle_user 用户执行命令返回非零状态码: $rc"
-  fi
-  return $rc
+  run_as_user "$oracle_user" "$1"
 }
 function run_as_grid() {
-  local command="$1"
-  local rc
-  su - "$grid_user" -c "$command"
-  rc=$?
-  if ((rc != 0)); then
-    color_printf yellow "警告：以 $grid_user 用户执行命令返回非零状态码: $rc"
-  fi
-  return $rc
+  run_as_user "$grid_user" "$1"
 }
 function execute_sqlplus() {
   local dbname="$1" format="$2" sql="$3"
@@ -401,9 +387,102 @@ function check_ip_connectivity() {
     color_printf red "IP地址 $ip 无法 ping 通，请检查！"
   fi
 }
+#==============================================================#
+#                        共享工具函数                            #
+#==============================================================#
+function run_as_user() {
+  local user="$1" command="$2"
+  local rc
+  su - "$user" -c "$command"
+  rc=$?
+  if ((rc != 0)); then
+    color_printf yellow "警告：以 $user 用户执行命令返回非零状态码: $rc"
+  fi
+  return $rc
+}
+function show_active_config() {
+  grep -v "^\s*\(#\|$\)" "$1"
+}
+function service_action() {
+  local service="$1" action="$2"
+  if ((os_version == 6)); then
+    case "$action" in
+      start)   service "$service" start >/dev/null 2>&1 ;;
+      stop)    service "$service" stop >/dev/null 2>&1 ;;
+      restart) service "$service" restart >/dev/null 2>&1 ;;
+      enable)  chkconfig "$service" on >/dev/null 2>&1 ;;
+      disable) chkconfig "$service" off >/dev/null 2>&1 ;;
+      status)  service "$service" status ;;
+    esac
+  else
+    case "$action" in
+      enable)  systemctl enable "$service" >/dev/null 2>&1 ;;
+      disable) systemctl disable "$service" >/dev/null 2>&1 ;;
+      status)  systemctl status "$service" ;;
+      *)       systemctl "$action" "$service" >/dev/null 2>&1 ;;
+    esac
+  fi
+}
+function get_response_file_version() {
+  local prefix="$1" version="$2"
+  declare -A version_map=(
+    ["11"]="v11_2_0"
+    ["12"]="v12.2.0"
+    ["19"]="v19.0.0"
+    ["21"]="v21.0.0"
+    ["23"]="v23.0.0"
+  )
+  echo "${prefix}${version_map[$version]}"
+}
+function generate_rman_backup_script() {
+  local level="$1" dbname="$2" scripts_dir="$3" rman_log_dir="$4" rman_config="$5"
+  local script_path="$scripts_dir/dbbackup_lv${level}_$dbname.sh"
+  cat >"$script_path" <<BACKUP
+#!/bin/bash
+source ~/.$dbname
+backtime=\$(date +"20%y%m%d%H%M%S")
+rman target / log=$rman_log_dir/level${level}_backup_${dbname}_\$backtime.log<<-EOF
+run {
+$rman_config
+backup incremental level $level database include current controlfile format '/backup/backlv${level}_%d_%T_%t_%s_%p';
+}
+EOF
+BACKUP
+  chmod +x "$script_path"
+}
+function build_asmca_cmd() {
+  local group_name="$1" disk_list="$2" redundancy="$3"
+  echo -e "$env_grid_home/bin/asmca -silent \\
+-createDiskGroup \\
+-diskGroupName $group_name \\
+-diskList $disk_list \\
+-redundancy $redundancy \\
+-au_size $ausize \\
+-compatible.asm $gi_compatible \\
+-compatible.rdbms $db_compatible"
+}
+function db_restart() {
+  local dbname="$1" mode="${2:-}"
+  if [[ "$oracle_install_mode" == "standalone" ]]; then
+    run_as_oracle "srvctl stop database -d $dbname"
+    if [[ -n "$mode" ]]; then
+      run_as_oracle "srvctl start database -d $dbname -o $mode"
+    else
+      run_as_oracle "srvctl start database -d $dbname"
+    fi
+  else
+    if [[ "$mode" == "nomount" ]]; then
+      execute_sqlplus "$dbname" "" "shu immediate;
+startup nomount;" >/dev/null 2>&1
+    else
+      execute_sqlplus "$dbname" "" "shu immediate;
+startup;" >/dev/null 2>&1
+    fi
+  fi
+}
 #============================================================#
 #                          GET WWID                            #
-#==============================================================#
+#=============================================================#
 function get_wwid() {
   local wwid scsi_id
   # 根据操作系统版本设置 scsi_id 命令路径
@@ -963,7 +1042,7 @@ function conf_nsysctl() {
     write_file "N" "/etc/sysconfig/network" "# OracleBegin
 NOZEROCONF=yes"
     # 记录更改前后的差异到日志中
-    grep -v "^\s*\(#\|$\)" /etc/sysconfig/network
+    show_active_config /etc/sysconfig/network
   fi
 }
 #==============================================================#
@@ -1150,7 +1229,7 @@ function conf_hosts() {
 # OracleBegin
 # Public IP
 $local_ip	$hostname"
-  grep -v "^\s*\(#\|$\)" /etc/hosts >>"$oracleinstalllog" 2>&1 &
+  show_active_config /etc/hosts >>"$oracleinstalllog" 2>&1 &
 }
 #==============================================================#
 #                        创建用户和组                            #
@@ -1389,7 +1468,7 @@ $grid_user hard nproc 16384"
   fi
   # 记录 /etc/security/limits.conf 文件的输出到日志中
   color_printf blue "查看 /etc/security/limits.conf："
-  grep -v "^\s*\(#\|$\)" /etc/security/limits.conf
+  show_active_config /etc/security/limits.conf
   # 备份 /etc/pam.d/login 文件
   backup_restore_file /etc/pam.d/login
   # 在 /etc/pam.d/login 文件末尾添加 Oracle 的配置
@@ -1399,7 +1478,7 @@ session required pam_limits.so
   # 记录 /etc/pam.d/login 文件的输出到日志中
   echo
   color_printf blue "查看 /etc/pam.d/login 文件："
-  grep -v "^\s*\(#\|$\)" /etc/pam.d/login
+  show_active_config /etc/pam.d/login
 }
 #==============================================================#
 #                         配置 /dev/shm                        #
@@ -1425,7 +1504,7 @@ tmpfs /dev/shm tmpfs size=${os_memory_total}k 0 0"
   # 重新挂载 /dev/shm
   mount -o remount /dev/shm
   color_printf blue "查看 Linux 挂载情况：/etc/fstab"
-  grep -v "^\s*\(#\|$\)" /etc/fstab
+  show_active_config /etc/fstab
 }
 #==============================================================#
 #                       安装 rlwrap 插件                        #
@@ -1474,7 +1553,7 @@ alias crsctl='$env_grid_home/bin/crsctl'
 alias srvctl='$env_grid_home/bin/srvctl'"
   fi
   color_printf blue "查看 root 用户环境变量：/root/$profile_name"
-  grep -v "^\s*\(#\|$\)" /root/"$profile_name"
+  show_active_config /root/"$profile_name"
   # 获取 ASM 实例名称
   grid_sid=+ASM
   # 获取 DB 实例名
@@ -1532,7 +1611,7 @@ alias rman='rlwrap rman'
 alias adrci='rlwrap adrci'"
     fi
     color_printf blue "查看 $oracle_user 用户环境变量：/home/$oracle_user/$profile_name"
-    grep -v "^\s*\(#\|$\)" /home/"$oracle_user"/"$profile_name"
+    show_active_config /home/"$oracle_user"/"$profile_name"
     # 创建一个与实例名同名的环境变量
     /bin/cp -f "/home/$oracle_user/$profile_name" "/home/$oracle_user/.${oracle_sids[i]}"
     chown -R "$oracle_user":oinstall "/home/$oracle_user/"
@@ -1564,7 +1643,7 @@ export PS1=\"[\`whoami\`@\`hostname\`:\"'\$PWD]\$ '"
 alias adrci='rlwrap adrci'"
     fi
     color_printf blue "查看 $grid_user 用户环境变量：/home/$grid_user/$profile_name"
-    grep -v "^\s*\(#\|$\)" /home/"$grid_user"/"$profile_name"
+    show_active_config /home/"$grid_user"/"$profile_name"
     chown -R "$grid_user":oinstall "/home/$grid_user/"
   fi
 }
@@ -1607,14 +1686,7 @@ function conf_asm() {
     # 启用多路径
     mpathconf --enable --with_multipathd y >/dev/null 2>&1
     # 配置多路径开机自启和获取根目录磁盘
-    case "$os_version" in
-    "6")
-      chkconfig multipathd.service on >/dev/null 2>&1
-      ;;
-    *)
-      systemctl enable multipathd.service >/dev/null 2>&1
-      ;;
-    esac
+    service_action "multipathd.service" "enable"
     backup_restore_file /etc/multipath.conf
     # 配置 multipath.conf
     write_file "Y" "/etc/multipath.conf" "# OracleBegin
@@ -1682,18 +1754,9 @@ alias $ALIAS
       sed -i 's/1ATA_//' /etc/udev/rules.d/99-oracle-asmdevices.rules
     fi
     # 启用及查看多路径服务状态
-    case "$os_version" in
-    "6")
-      if ! service multipathd restart >>"$oracleinstalllog" 2>&1; then
-        color_printf yellow "警告：multipathd 服务重启失败"
-      fi
-      ;;
-    *)
-      if ! systemctl restart multipathd >>"$oracleinstalllog" 2>&1; then
-        color_printf yellow "警告：multipathd 服务重启失败"
-      fi
-      ;;
-    esac
+    if ! service_action "multipathd" "restart" >>"$oracleinstalllog" 2>&1; then
+      color_printf yellow "警告：multipathd 服务重启失败"
+    fi
     color_printf blue "检查 Mulltipath 多路径情况：" >>"$oracleinstalllog"
     while true; do
       if multipath -ll >>"$oracleinstalllog" 2>&1; then
@@ -1795,7 +1858,7 @@ function conf_gridrsp() {
   case "$gi_version" in
   "11")
     gridrsp_array+=(
-      "oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v11_2_0"
+      "oracle.install.responseFileVersion=$(get_response_file_version "/oracle/install/rspfmt_crsinstall_response_schema_" "11")"
       "SELECTED_LANGUAGES=en"
       "ORACLE_HOME=$env_grid_home"
       "oracle.install.crs.config.storageOption=ASM_STORAGE"
@@ -1814,27 +1877,10 @@ function conf_gridrsp() {
       "oracle.install.config.managementOption=NONE"
       "oracle.install.crs.rootconfig.executeRootScript=false"
     )
+    gridrsp_array+=("oracle.install.responseFileVersion=$(get_response_file_version "/oracle/install/rspfmt_crsinstall_response_schema_" "$gi_version")")
     case "$gi_version" in
-    "12")
-      gridrsp_array+=("oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v12.2.0")
-      ;;
-    "19")
+    "19" | "21" | "23")
       gridrsp_array+=(
-        "oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0"
-        "oracle.install.crs.config.scanType=LOCAL_SCAN"
-        "oracle.install.crs.configureGIMR=false"
-      )
-      ;;
-    "21")
-      gridrsp_array+=(
-        "oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v21.0.0"
-        "oracle.install.crs.config.scanType=LOCAL_SCAN"
-        "oracle.install.crs.configureGIMR=false"
-      )
-      ;;
-    "23")
-      gridrsp_array+=(
-        "oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v23.0.0"
         "oracle.install.crs.config.scanType=LOCAL_SCAN"
         "oracle.install.crs.configureGIMR=false"
       )
@@ -1978,25 +2024,11 @@ function get_asmca_cmd() {
   # 打印日志
   log_print "静默创建 ASM 磁盘组命令"
   # 操作Grid用户创建数据磁盘组
-  data_asmca_cmd=$(echo -e "$env_grid_home/bin/asmca -silent \\
--createDiskGroup \\
--diskGroupName $data_asm_group \\
--diskList $datadisk \\
--redundancy $data_redun \\
--au_size $ausize \\
--compatible.asm $gi_compatible \\
--compatible.rdbms $db_compatible")
+  data_asmca_cmd=$(build_asmca_cmd "$data_asm_group" "$datadisk" "$data_redun")
   color_printf blue "$data_asmca_cmd"
   # 判断归档磁盘是否存在，并操作Grid用户创建归档磁盘组
   if [[ -n "$arch_base_disk" ]]; then
-    arch_asmca_cmd=$(echo -e "$env_grid_home/bin/asmca -silent \\
--createDiskGroup \\
--diskGroupName $arch_asm_group \\
--diskList $archdisk \\
--au_size $ausize \\
--redundancy $arch_redun \\
--compatible.asm $gi_compatible \\
--compatible.rdbms $db_compatible")
+    arch_asmca_cmd=$(build_asmca_cmd "$arch_asm_group" "$archdisk" "$arch_redun")
     color_printf blue "$arch_asmca_cmd"
   fi
 }
@@ -2072,7 +2104,7 @@ function conf_oraclersp() {
   case "$db_version" in
   "11")
     oracle_rsp_arr+=(
-      "oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v11_2_0"
+      "oracle.install.responseFileVersion=$(get_response_file_version "/oracle/install/rspfmt_dbinstall_response_schema_" "11")"
       "SELECTED_LANGUAGES=en,zh_CN"
       "ORACLE_HOME=$env_oracle_home"
       "oracle.install.db.DBA_GROUP=dba"
@@ -2083,7 +2115,7 @@ function conf_oraclersp() {
     ;;
   "12")
     oracle_rsp_arr+=(
-      "oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v12.2.0"
+      "oracle.install.responseFileVersion=$(get_response_file_version "/oracle/install/rspfmt_dbinstall_response_schema_" "12")"
       "SELECTED_LANGUAGES=en,zh_CN"
       "ORACLE_HOME=$env_oracle_home"
       "oracle.install.db.OSDBA_GROUP=dba"
@@ -2105,17 +2137,7 @@ function conf_oraclersp() {
       "oracle.install.db.rootconfig.executeRootScript=false"
       "oracle.install.db.rootconfig.configMethod="
     )
-    case "$db_version" in
-    "19")
-      oracle_rsp_arr+=("oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v19.0.0")
-      ;;
-    "21")
-      oracle_rsp_arr+=("oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v21.0.0")
-      ;;
-    "23")
-      oracle_rsp_arr+=("oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v23.0.0")
-      ;;
-    esac
+    oracle_rsp_arr+=("oracle.install.responseFileVersion=$(get_response_file_version "/oracle/install/rspfmt_dbinstall_response_schema_" "$db_version")")
     ;;
   esac
   rm_file "$software_dir/oracle.rsp"
@@ -2316,20 +2338,7 @@ function get_dbca_rsp() {
       )
       ;;
     esac
-    case "$db_version" in
-    "12")
-      db_rsp_arr+=("responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v12.2.0")
-      ;;
-    "19")
-      db_rsp_arr+=("responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v19.0.0")
-      ;;
-    "21")
-      db_rsp_arr+=("responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v21.0.0")
-      ;;
-    "23")
-      db_rsp_arr+=("responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v23.0.0")
-      ;;
-    esac
+    db_rsp_arr+=("responseFileVersion=$(get_response_file_version "/oracle/assistants/rspfmt_dbca_response_schema_" "$db_version")")
     redoline="<fileSize unit=\"KB\">204800</fileSize>"
   fi
   # 使用归档日志模式
@@ -2486,15 +2495,11 @@ function conf_controlfile() {
     ctl_path=$(execute_sqlplus "$dbname" "set pagesize0" "select substr(name, 1, instr(name, '/', 1, 3)) from v\$controlfile;" | tr -d '[:space:]')
     if [[ "$oracle_install_mode" == "standalone" ]]; then
       ctl_name_new=$(execute_sqlplus "$dbname" "set pagesize 0" "select substr(replace(name,substr(name,1,instr(name,'/',1)-1),'+$data_asm_group'),1,instr(name,'/',-1)-1) || '/control02.ctl' from v\$controlfile where name = '$ctl_name';" | tr -d '[:space:]')
-      # 重启数据库至 nomount 状态
-      run_as_oracle "srvctl stop database -d $dbname"
-      run_as_oracle "srvctl start database -d $dbname -o nomount"
     else
       ctl_name_new="${ctl_path}control02.ctl"
-      # 重启数据库至 nomount 状态
-      execute_sqlplus "$dbname" "" "shu immediate;
-startup nomount;" >/dev/null 2>&1
     fi
+    # 重启数据库至 nomount 状态
+    db_restart "$dbname" "nomount"
     # 从原来的控制文件恢复一个新的控制文件
     su - "$oracle_user" <<-SO
 source /home/$oracle_user/.$dbname
@@ -2505,13 +2510,7 @@ SO
     # 修改数据库控制文件参数
     execute_sqlplus "$dbname" "" "alter system set control_files='$ctl_name','$ctl_name_new' scope=spfile;"
     # 重启数据库生效参数
-    if [[ "$oracle_install_mode" == "standalone" ]]; then
-      run_as_oracle "srvctl stop database -d $dbname"
-      run_as_oracle "srvctl start database -d $dbname"
-    else
-      execute_sqlplus "$dbname" "" "shu immediate;
-startup;" >/dev/null 2>&1
-    fi
+    db_restart "$dbname"
   fi
   # 查询当前数据库控制文件
   echo
@@ -2573,7 +2572,7 @@ function db_autostart() {
 su $oracle_user -lc \"$env_oracle_home/bin/lsnrctl start\"
 su $oracle_user -lc \"$env_oracle_home/bin/dbstart\""
     chmod +x $rc_file
-    grep -v "^\s*\(#\|$\)" $rc_file
+    show_active_config $rc_file
   fi
 }
 #==============================================================#
@@ -2612,32 +2611,10 @@ DELARCH
   chmod +x "$del_arch_script"
   # Level 0 备份脚本
   local lv0_backup_script="$scripts_dir/dbbackup_lv0_$dbname.sh"
-  cat >"$lv0_backup_script" <<LV0BACKUP
-#!/bin/bash
-source ~/.$dbname
-backtime=\$(date +"20%y%m%d%H%M%S")
-rman target / log=$rman_log_dir/level0_backup_${dbname}_\$backtime.log<<-EOF
-run {
-$rman_config
-backup incremental level 0 database include current controlfile format '/backup/backlv0_%d_%T_%t_%s_%p';
-}
-EOF
-LV0BACKUP
-  chmod +x "$lv0_backup_script"
+  generate_rman_backup_script "0" "$dbname" "$scripts_dir" "$rman_log_dir" "$rman_config"
   # Level 1 备份脚本
   local lv1_backup_script="$scripts_dir/dbbackup_lv1_$dbname.sh"
-  cat >"$lv1_backup_script" <<LV1BACKUP
-#!/bin/bash
-source ~/.$dbname
-backtime=\$(date +"20%y%m%d%H%M%S")
-rman target / log=$rman_log_dir/level1_backup_${dbname}_\$backtime.log<<-EOF
-run {
-$rman_config
-backup incremental level 1 database include current controlfile format '/backup/backlv1_%d_%T_%t_%s_%p';
-}
-EOF
-LV1BACKUP
-  chmod +x "$lv1_backup_script"
+  generate_rman_backup_script "1" "$dbname" "$scripts_dir" "$rman_log_dir" "$rman_config"
   # 添加 crontab 计划任务
   local crontab_file="/var/spool/cron/$oracle_user"
   if check_file "$crontab_file"; then
