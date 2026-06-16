@@ -246,11 +246,15 @@ function check_password() {
   local password="$2"
   # 密码中不能有不可见的控制字符，例如回车换行制表符等
   if [[ $password =~ [[:cntrl:]] ]]; then
-    color_printf red "参数 [ $1 ] 的密码 $2 不符合要求，包含不可见字符，请检查！"
+    color_printf red "参数 [ $1 ] 的密码不符合要求，包含不可见字符，请检查！"
+  fi
+  # 密码最小长度要求
+  if ((${#password} < 8)); then
+    color_printf yellow "警告：参数 [ $1 ] 的密码长度小于 8 位，建议使用更强的密码！"
   fi
   if [[ $1 == "-dp" ]]; then
     if ! [[ $password =~ ^[a-zA-Z][a-zA-Z0-9#$_]*$ ]]; then
-      color_printf red "参数 [ $1 ] 的密码 $2 不符合要求，必须以字母开头，并且字符只能包含 (_)，(#)，($) ，请检查！"
+      color_printf red "参数 [ $1 ] 的密码不符合要求，必须以字母开头，并且字符只能包含 (_)，(#)，($) ，请检查！"
     fi
   fi
 }
@@ -1844,8 +1848,9 @@ function conf_gridrsp() {
   esac
   rm_file "$software_dir/grid.rsp"
   printf '%s\n' "${gridrsp_array[@]}" >>"$software_dir"/grid.rsp
-  # 记录grid.rsp文件内容到日志中
-  cat "$software_dir"/grid.rsp
+  chmod 600 "$software_dir"/grid.rsp
+  # 记录grid.rsp文件内容到日志中（过滤密码）
+  grep -vi 'password' "$software_dir"/grid.rsp
 }
 #==============================================================#
 #                      获取安装 grid 命令                        #
@@ -1947,6 +1952,7 @@ function after_grid_install() {
     # 添加 asm 账户密码信息到 cfgrsp.properties 文件中
     write_file "N" "/home/$grid_user/cfgrsp.properties" "oracle.assistants.asm|S_ASMPASSWORD=$database_passwd
 oracle.assistants.asm|S_ASMMONITORPASSWORD=$database_passwd"
+    chmod 600 /home/"$grid_user"/cfgrsp.properties
     if ! run_as_grid "$env_grid_home/cfgtoollogs/configToolAllCommands RESPONSE_FILE=/home/$grid_user/cfgrsp.properties" >>"$oracleinstalllog" 2>&1; then
       color_printf yellow "警告：Grid configToolAllCommands 执行返回非零状态码，请检查日志 $oracleinstalllog"
     fi
@@ -2120,6 +2126,7 @@ function conf_oraclersp() {
   esac
   rm_file "$software_dir/oracle.rsp"
   printf '%s\n' "${oracle_rsp_arr[@]}" >"$software_dir/oracle.rsp"
+  chmod 600 "$software_dir/oracle.rsp"
   # 记录 oracle.rsp 文件内容到日志中
   cat "$software_dir/oracle.rsp"
 }
@@ -2346,8 +2353,9 @@ function get_dbca_rsp() {
   fi
   rm_file "$software_dir/db.rsp"
   printf '%s\n' "${db_rsp_arr[@]}" >"$software_dir/db.rsp"
-  # 记录 db.rsp 文件内容到日志中
-  cat "$software_dir/db.rsp"
+  chmod 600 "$software_dir/db.rsp"
+  # 记录 db.rsp 文件内容到日志中（过滤密码）
+  grep -vi 'password' "$software_dir/db.rsp"
 }
 #==============================================================#
 #                       获取 DB 创建命令                         #
@@ -2433,8 +2441,8 @@ function conf_sqlnet() {
   fi
   run_as_oracle "cat <<-EOF >>$env_oracle_home/network/admin/sqlnet.ora
 # OracleBegin
-SQLNET.ALLOWED_LOGON_VERSION_CLIENT=8
-SQLNET.ALLOWED_LOGON_VERSION_SERVER=8
+SQLNET.ALLOWED_LOGON_VERSION_CLIENT=12
+SQLNET.ALLOWED_LOGON_VERSION_SERVER=12
 EOF"
 }
 #==============================================================#
@@ -2689,9 +2697,9 @@ END;
 /
 alter profile default limit password_grace_time unlimited;
 alter profile default limit password_life_time unlimited;
-alter profile default limit password_lock_time unlimited;
-alter profile default limit failed_login_attempts unlimited;
-alter system set audit_trail=none sid='*' scope=spfile;
+alter profile default limit password_lock_time 1;
+alter profile default limit failed_login_attempts 10;
+alter system set audit_trail=DB sid='*' scope=spfile;
 alter system set sga_max_size=$sga_target sid='*' scope=spfile;
 alter system set sga_target=$sga_target sid='*' scope=spfile;
 alter system set pga_aggregate_target=$pga_target sid='*' scope=spfile;
@@ -2722,8 +2730,7 @@ alter system set \"_partition_large_extents\"=false sid='*' scope=spfile;
 alter system set \"_index_partition_large_extents\"=false sid='*' scope=spfile;
 alter system set \"_use_adaptive_log_file_sync\"=false sid='*' scope=spfile;
 alter system set \"_memory_imm_mode_without_autosga\"=false sid='*' scope=spfile;
-alter system set enable_ddl_logging=true sid='*' scope=spfile;
-alter system set sec_case_sensitive_logon=false sid='*' scope=spfile;"
+alter system set enable_ddl_logging=true sid='*' scope=spfile;"
   fi
   color_printf blue "数据库参数："
   # 查看数据库参数
@@ -3207,6 +3214,10 @@ function conf_master_node() {
   fi
 }
 function handle_para() {
+  # 安全检查：检查是否使用了默认密码
+  if [[ "$oracle_passwd" == "oracle" || "$database_passwd" == "oracle" || "$grid_passwd" == "oracle" ]]; then
+    color_printf yellow "安全警告：检测到使用默认密码 'oracle'，强烈建议通过 -op、-dp、-gp 参数设置强密码！"
+  fi
   # 全局变量赋值
   if [[ $software_dir == "$env_base_dir" ]]; then
     color_printf red "Oracle 软件安装包以及脚本不能放在 $env_base_dir，建议创建 /soft 目录存放！"
